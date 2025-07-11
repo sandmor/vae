@@ -1,3 +1,5 @@
+
+
 import os
 import math
 import torch
@@ -5,14 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
+from torchvision import transforms, models
 from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 from tqdm import tqdm
 import json
-from transformers import Dinov2Model
 from pathlib import Path
 from typing import Optional, Tuple, List
 from dotenv import load_dotenv
@@ -23,149 +24,38 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class CatDataset(Dataset):
-    """
-    Custom dataset for cat images with flexible preprocessing
-    """
+
+
+class CelebADataset(Dataset):
+    """Simple CelebA dataset loader for Kaggle dataset structure"""
     
-    def __init__(self, 
-                 root_dir: str,
-                 transform: Optional[transforms.Compose] = None,
-                 image_size: int = 224,
-                 max_images: Optional[int] = None,
-                 valid_extensions: Tuple[str, ...] = ('.jpg', '.jpeg', '.png', '.bmp')):
-        """
-        Initialize Cat Dataset
-        
-        Args:
-            root_dir: Path to dataset directory
-            transform: Optional transform to apply to images
-            image_size: Target image size (assumes square images)
-            max_images: Maximum number of images to load (for testing)
-            valid_extensions: Valid image file extensions
-        """
+    def __init__(self, root_dir: str, transform=None, max_images=None):
         self.root_dir = Path(root_dir)
-        self.image_size = image_size
-        self.max_images = max_images
-        self.valid_extensions = valid_extensions
+        self.transform = transform
         
-        # Find all image files
-        self.image_paths = self._find_images()
+        # Kaggle CelebA structure: img_align_celeba/ folder with .jpg files
+        img_dir = self.root_dir / "img_align_celeba"
+        if not img_dir.exists():
+            img_dir = self.root_dir  # Fallback to root if direct structure
         
-        # Set up transforms
-        self.transform = transform if transform else self._default_transform()
+        self.image_paths = list(img_dir.glob("*.jpg"))
         
-        logger.info(f"Found {len(self.image_paths)} cat images in {root_dir}")
+        if max_images:
+            self.image_paths = self.image_paths[:max_images]
         
-    def _find_images(self) -> List[Path]:
-        """Find all valid image files in the dataset directory"""
-        image_paths = []
-        
-        # Handle different possible dataset structures
-        if (self.root_dir / "PetImages" / "Cat").exists():
-            # Microsoft Cat vs Dog dataset structure
-            cat_dir = self.root_dir / "PetImages" / "Cat"
-            search_dirs = [cat_dir]
-        elif (self.root_dir / "cats").exists():
-            # Simple cats directory structure
-            search_dirs = [self.root_dir / "cats"]
-        else:
-            # Search in root directory and subdirectories
-            search_dirs = [self.root_dir]
-        
-        for search_dir in search_dirs:
-            for ext in self.valid_extensions:
-                pattern = f"*{ext}"
-                found_files = list(search_dir.rglob(pattern))
-                image_paths.extend(found_files)
-        
-        # Remove duplicates and sort
-        image_paths = sorted(list(set(image_paths)))
-        
-        # Filter corrupted images
-        image_paths = self._filter_valid_images(image_paths)
-        
-        # Limit number of images if specified
-        if self.max_images:
-            image_paths = image_paths[:self.max_images]
-            
-        return image_paths
+        logger.info(f"Found {len(self.image_paths)} CelebA images in {root_dir}")
     
-    def _filter_valid_images(self, image_paths: List[Path]) -> List[Path]:
-        """Filter out corrupted or invalid images"""
-        valid_paths = []
-        
-        for path in image_paths:
-            try:
-                # Quick check: file size should be reasonable
-                if path.stat().st_size < 1024:  # Less than 1KB
-                    continue
-                    
-                # Try to open image
-                with Image.open(path) as img:
-                    # Check if image can be loaded and has reasonable dimensions
-                    if img.size[0] < 32 or img.size[1] < 32:
-                        continue
-                    # Convert to RGB to ensure compatibility
-                    img.convert('RGB')
-                    
-                valid_paths.append(path)
-                
-            except Exception as e:
-                logger.warning(f"Skipping corrupted image {path}: {e}")
-                continue
-        
-        logger.info(f"Filtered {len(image_paths)} -> {len(valid_paths)} valid images")
-        return valid_paths
-    
-    def _default_transform(self) -> transforms.Compose:
-        """Default image preprocessing pipeline"""
-        return transforms.Compose([
-            transforms.Resize((self.image_size, self.image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Normalize to [-1, 1]
-        ])
-    
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.image_paths)
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        """
-        Get a single item from the dataset
-        
-        Returns:
-            image: Preprocessed image tensor
-            label: Dummy label (always 0 for unsupervised learning)
-        """
+    def __getitem__(self, idx):
         image_path = self.image_paths[idx]
+        image = Image.open(image_path).convert('RGB')
         
-        try:
-            # Load image
-            image = Image.open(image_path).convert('RGB')
-            
-            # Apply transforms
-            if self.transform:
-                image = self.transform(image)
-            
-            # Return image with dummy label (VAE doesn't need labels)
-            return image, 0
-            
-        except Exception as e:
-            logger.error(f"Error loading image {image_path}: {e}")
-            # Return a black image as fallback
-            fallback_image = torch.zeros(3, self.image_size, self.image_size)
-            return fallback_image, 0
-    
-    def get_sample_images(self, num_samples: int = 8) -> List[torch.Tensor]:
-        """Get sample images for visualization"""
-        indices = np.random.choice(len(self), min(num_samples, len(self)), replace=False)
-        samples = []
+        if self.transform:
+            image = self.transform(image)
         
-        for idx in indices:
-            image, _ = self[idx]
-            samples.append(image)
-            
-        return samples
+        return image, 0
 
 def get_data_transforms(image_size: int = 224, 
                        augment: bool = True) -> Tuple[transforms.Compose, transforms.Compose]:
@@ -180,11 +70,11 @@ def get_data_transforms(image_size: int = 224,
         train_transform, val_transform
     """
     
-    # Base transforms
+    # Base transforms with ImageNet normalization
     base_transforms = [
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ]
     
     # Training transforms with augmentation
@@ -196,7 +86,7 @@ def get_data_transforms(image_size: int = 224,
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
             transforms.RandomRotation(degrees=15),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]
     else:
         train_transforms = base_transforms
@@ -207,90 +97,74 @@ def get_data_transforms(image_size: int = 224,
     return transforms.Compose(train_transforms), transforms.Compose(val_transforms)
 
 
-def create_data_loaders(dataset_path: Optional[str] = None,
-                       batch_size: int = 32,
-                       image_size: int = 224,
-                       train_split: float = 0.8,
-                       augment: bool = True,
-                       num_workers: int = 4,
-                       max_images: Optional[int] = None) -> Tuple[DataLoader, DataLoader]:
-    """
-    Create training and validation data loaders
+def create_data_loaders(dataset_path=None, batch_size=32, 
+                       image_size=224, train_split=0.8, augment=True, 
+                       num_workers=4, max_images=None):
+    """Create training and validation data loaders"""
     
-    Args:
-        dataset_path: Path to dataset (if None, loads from environment)
-        batch_size: Batch size for data loaders
-        image_size: Target image size
-        train_split: Fraction of data to use for training
-        augment: Whether to apply data augmentation
-        num_workers: Number of worker processes for data loading
-        max_images: Maximum number of images to load (for testing)
-    
-    Returns:
-        train_loader, val_loader
-    """
-    
-    # Get dataset path from environment if not provided
+    # Get dataset path
     if dataset_path is None:
-        dataset_path = os.getenv('CAT_DATASET_PATH')
-        if dataset_path is None:
-            raise ValueError("CAT_DATASET_PATH environment variable not set and no path provided")
-    
-    # Verify path exists
+        dataset_path = os.getenv('CELEBA_DATASET_PATH', 'celeba/img_align_celeba/img_align_celeba')
+
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
     
     # Get transforms
     train_transform, val_transform = get_data_transforms(image_size, augment)
     
-    # Create full dataset
-    full_dataset = CatDataset(
-        root_dir=dataset_path,
-        transform=None,  # We'll apply transforms separately
-        image_size=image_size,
-        max_images=max_images
-    )
+    # Create full dataset and split manually
+    full_dataset = CelebADataset(dataset_path, transform=None, max_images=max_images)
     
-    # Split dataset
-    dataset_size = len(full_dataset)
-    train_size = int(train_split * dataset_size)
-    val_size = dataset_size - train_size
+    # Simple split
+    total_size = len(full_dataset)
+    train_size = int(train_split * total_size)
+    val_size = total_size - train_size
     
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size]
-    )
+    train_indices = list(range(train_size))
+    val_indices = list(range(train_size, total_size))
     
-    # Apply different transforms to splits
-    train_dataset.dataset.transform = train_transform
-    val_dataset.dataset.transform = val_transform
+    # Create datasets with transforms
+    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+    
+    # Wrap with transform
+    train_dataset = TransformDataset(train_dataset, train_transform)
+    val_dataset = TransformDataset(val_dataset, val_transform)
     
     # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=True  # Ensures consistent batch sizes
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False
-    )
-    
-    logger.info(f"Created data loaders:")
-    logger.info(f"  Training samples: {len(train_dataset)}")
-    logger.info(f"  Validation samples: {len(val_dataset)}")
-    logger.info(f"  Batch size: {batch_size}")
-    logger.info(f"  Training batches: {len(train_loader)}")
-    logger.info(f"  Validation batches: {len(val_loader)}")
-    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                             num_workers=num_workers, pin_memory=torch.cuda.is_available())
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
+                           num_workers=num_workers, pin_memory=torch.cuda.is_available())
+
+    logger.info(f"Created CelebA data loaders: {len(train_dataset)} train, {len(val_dataset)} val")
+
     return train_loader, val_loader
+
+class TransformDataset(Dataset):
+    """Simple wrapper to apply transforms to a dataset"""
+    def __init__(self, dataset, transform):
+        self.dataset = dataset
+        self.transform = transform
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        if hasattr(self.dataset, 'dataset'):
+            # Handle Subset case
+            image_path = self.dataset.dataset.image_paths[self.dataset.indices[idx]]
+            image = Image.open(image_path).convert('RGB')
+        else:
+            image, _ = self.dataset[idx]
+            if isinstance(image, torch.Tensor):
+                # Convert tensor back to PIL for transforms
+                image = transforms.ToPILImage()(image)
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, 0
 
 def visualize_batch(data_loader: DataLoader, 
                    num_images: int = 8,
@@ -314,9 +188,13 @@ def visualize_batch(data_loader: DataLoader,
     fig, axes = plt.subplots(2, 4, figsize=figsize)
     axes = axes.flatten()
     
+    # ImageNet normalization parameters
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    
     for i, img in enumerate(images):
-        # Convert from [-1, 1] to [0, 1] for display
-        img_display = (img + 1) / 2
+        # Denormalize from ImageNet normalization
+        img_display = img * std + mean
         img_display = torch.clamp(img_display, 0, 1)
         
         # Convert to numpy and transpose for matplotlib
@@ -329,205 +207,223 @@ def visualize_batch(data_loader: DataLoader,
     plt.tight_layout()
     plt.show()
 
+class ResNetEncoder(nn.Module):
+    """
+    ResNet-based encoder for VAE
+    """
+    
+    def __init__(self, 
+                 latent_dim: int = 512,
+                 resnet_variant: str = 'resnet18',
+                 pretrained: bool = True,
+                 freeze_early_layers: bool = True):
+        """
+        Initialize ResNet encoder
+        
+        Args:
+            latent_dim: Dimension of latent space
+            resnet_variant: Which ResNet variant to use
+            pretrained: Whether to use pretrained weights
+            freeze_early_layers: Whether to freeze early convolutional layers
+        """
+        super().__init__()
+        
+        self.latent_dim = latent_dim
+        
+        # Load ResNet backbone
+        if resnet_variant == 'resnet18':
+            self.backbone = models.resnet18(pretrained=pretrained)
+            feature_dim = 512
+        elif resnet_variant == 'resnet34':
+            self.backbone = models.resnet34(pretrained=pretrained)
+            feature_dim = 512
+        elif resnet_variant == 'resnet50':
+            self.backbone = models.resnet50(pretrained=pretrained)
+            feature_dim = 2048
+        else:
+            raise ValueError(f"Unsupported ResNet variant: {resnet_variant}")
+        
+        # Remove the final classification layer
+        self.backbone = nn.Sequential(*list(self.backbone.children())[:-1])
+        
+        # Freeze early layers if requested
+        if freeze_early_layers:
+            self._freeze_early_layers()
+        
+        # Projection layers
+        self.feature_projection = nn.Sequential(
+            nn.Linear(feature_dim, latent_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+        
+        # Latent space parameters
+        self.mu_layer = nn.Linear(latent_dim, latent_dim)
+        self.logvar_layer = nn.Linear(latent_dim, latent_dim)
+        
+        logger.info(f"ResNet encoder initialized with {resnet_variant}")
+        logger.info(f"Feature dimension: {feature_dim}")
+        logger.info(f"Latent dimension: {latent_dim}")
+    
+    def _freeze_early_layers(self):
+        """Freeze early convolutional layers"""
+        # Freeze first few layers (conv1, bn1, relu, maxpool, layer1)
+        layers_to_freeze = ['0', '1', '2', '3', '4']  # indices in backbone
+        
+        for i, (name, module) in enumerate(self.backbone.named_children()):
+            if str(i) in layers_to_freeze:
+                for param in module.parameters():
+                    param.requires_grad = False
+        
+        logger.info("Frozen early ResNet layers")
+    
+    def forward(self, x):
+        """
+        Forward pass through encoder
+        
+        Args:
+            x: Input images [batch_size, 3, H, W]
+            
+        Returns:
+            mu: Mean of latent distribution
+            logvar: Log variance of latent distribution
+        """
+        # Extract features using ResNet backbone
+        features = self.backbone(x)  # [batch_size, feature_dim, 1, 1]
+        features = features.view(features.size(0), -1)  # [batch_size, feature_dim]
+        
+        # Project to latent space
+        projected = self.feature_projection(features)
+        
+        # Get mu and logvar
+        mu = self.mu_layer(projected)
+        logvar = self.logvar_layer(projected)
+        
+        return mu, logvar
+
 class VAE(nn.Module):
-    def __init__(self, latent_dim=512, image_size=224, projection_multiplier=2.0, min_hidden_dim=512):
+    def __init__(self, 
+                 latent_dim: int = 512, 
+                 image_size: int = 224,
+                 resnet_variant: str = 'resnet18',
+                 pretrained: bool = True,
+                 freeze_early_layers: bool = True):
+        """
+        ResNet-based VAE
+        
+        Args:
+            latent_dim: Dimension of latent space
+            image_size: Size of input/output images
+            resnet_variant: Which ResNet variant to use
+            pretrained: Whether to use pretrained ResNet weights
+            freeze_early_layers: Whether to freeze early ResNet layers
+        """
         super(VAE, self).__init__()
 
         self.latent_dim = latent_dim
         self.image_size = image_size
 
-        self.dinov2 = Dinov2Model.from_pretrained("facebook/dinov2-base")
-        self.dinov2_dim = self.dinov2.config.hidden_size
-
-        # Freeze the DINOv2 model parameters
-        for param in self.dinov2.parameters():
-            param.requires_grad = False
-        
-        self.encoder_projection = self._build_encoder_projection(
-            latent_dim, projection_multiplier, min_hidden_dim
+        # ResNet encoder
+        self.encoder = ResNetEncoder(
+            latent_dim=latent_dim,
+            resnet_variant=resnet_variant,
+            pretrained=pretrained,
+            freeze_early_layers=freeze_early_layers
         )
 
-        self.mu_layer = nn.Linear(latent_dim, self.latent_dim)
-        self.logvar_layer = nn.Linear(latent_dim, self.latent_dim)
-
+        # Decoder
         self.decoder = self._build_decoder()
     
-    def _build_encoder_projection(self, latent_dim, projection_multiplier, min_hidden_dim):
-        hidden_dim = max(min_hidden_dim, int(latent_dim * projection_multiplier))
-        
-        if latent_dim >= self.dinov2_dim:
-            hidden_dim = max(hidden_dim, int(self.dinov2_dim * 1.5))
-        
-        return nn.Sequential(
-            nn.Linear(self.dinov2_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, latent_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-        )
-    
     def _build_decoder(self):
-        if self.latent_dim <= 256:
-            spatial_dim = 7
+        """Build decoder network"""
+        
+        # Calculate initial spatial dimensions based on image size
+        if self.image_size <= 64:
+            initial_spatial = 4
             initial_channels = min(512, self.latent_dim * 2)
-        elif self.latent_dim <= 512:
-            spatial_dim = 7
+        elif self.image_size <= 128:
+            initial_spatial = 8
+            initial_channels = min(512, self.latent_dim)
+        elif self.image_size <= 256:
+            initial_spatial = 8
             initial_channels = 512
         else:
-            spatial_dim = 8
-            initial_channels = min(768, self.latent_dim)
+            initial_spatial = 16
+            initial_channels = 512
         
-        initial_spatial_dim = spatial_dim * spatial_dim * initial_channels
-
-        decoder_layers = []
-
-        expansion_dims = self._calculate_expansion_dims(
-            self.latent_dim,
-            initial_spatial_dim
-        )
-
-        for i in range(len(expansion_dims) - 1):
-            decoder_layers.extend([
-                nn.Linear(expansion_dims[i], expansion_dims[i + 1]),
-                nn.ReLU(),
-            ])
+        # Initial linear projection
+        initial_size = initial_channels * initial_spatial * initial_spatial
         
-        decoder_layers.append(Reshape(-1, initial_channels, spatial_dim, spatial_dim))
-
-        conv_layers = self._build_conv_layers(initial_channels, spatial_dim)
-        decoder_layers.extend(conv_layers)
-
-        return nn.Sequential(*decoder_layers)
-    
-    def _calculate_expansion_dims(self, start_dim, end_dim):
-        if start_dim >= end_dim:
-            return start_dim, end_dim
+        decoder_layers = [
+            nn.Linear(self.latent_dim, initial_size),
+            nn.ReLU(),
+            Reshape(-1, initial_channels, initial_spatial, initial_spatial)
+        ]
         
-        expansion_factor = 2.0
-        max_layers = 5
-
-        dims = [start_dim]
-        current_dim = start_dim
-        layer_count = 0
-
-        while current_dim < end_dim and layer_count < max_layers:
-            current_dim = min(int(current_dim * expansion_factor), end_dim)
-            dims.append(current_dim)
-            layer_count += 1
-        
-        if dims[-1] < end_dim:
-            dims.append(end_dim)
-        
-        return dims
-    
-    def _build_conv_layers(self, initial_channels, spatial_dim):
-        """
-        Build transposed convolution layers that scale to target image size
-        """
-        layers = []
+        # Convolutional layers for upsampling
+        current_spatial = initial_spatial
         current_channels = initial_channels
-        target_spatial = self.image_size
         
-        # Calculate exact upsampling path
-        upsampling_path = self._calculate_upsampling_path(spatial_dim, target_spatial)
+        # Calculate upsampling path
+        upsampling_steps = []
+        temp_spatial = current_spatial
+        while temp_spatial < self.image_size:
+            temp_spatial *= 2
+            upsampling_steps.append(min(temp_spatial, self.image_size))
         
-        # Channel schedule: reduce channels as we increase spatial resolution
-        channel_schedule = []
-        for i in range(len(upsampling_path) - 1):
-            # Exponential decay in channels
-            channels = max(16, current_channels // (2 ** i))
-            channel_schedule.append(channels)
-        
-        # Add transposed convolution layers
-        for i, (current_size, next_size) in enumerate(zip(upsampling_path[:-1], upsampling_path[1:])):
-            out_channels = channel_schedule[i]
+        # Build upsampling layers
+        for target_spatial in upsampling_steps:
+            next_channels = max(32, current_channels // 2)
             
-            # Calculate kernel size, stride, and padding for exact size
-            kernel_size, stride, padding = self._calculate_conv_params(current_size, next_size)
+            if target_spatial == current_spatial * 2:
+                # Standard 2x upsampling
+                decoder_layers.extend([
+                    nn.ConvTranspose2d(current_channels, next_channels, 
+                                     kernel_size=4, stride=2, padding=1),
+                    nn.BatchNorm2d(next_channels),
+                    nn.ReLU()
+                ])
+            else:
+                # Custom upsampling with interpolation
+                decoder_layers.extend([
+                    nn.Conv2d(current_channels, next_channels, 
+                             kernel_size=3, padding=1),
+                    nn.BatchNorm2d(next_channels),
+                    nn.ReLU(),
+                    nn.Upsample(size=(target_spatial, target_spatial), 
+                               mode='bilinear', align_corners=False)
+                ])
             
-            layers.extend([
-                nn.ConvTranspose2d(
-                    current_channels, out_channels,
-                    kernel_size=kernel_size, stride=stride, padding=padding
-                ),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU()
-            ])
-            current_channels = out_channels
+            current_channels = next_channels
+            current_spatial = target_spatial
         
-        # Final layer to RGB with adaptive interpolation if needed
-        layers.extend([
-            AdaptiveUpsampler(current_channels, 3, target_spatial),
+        # Final layer to RGB
+        decoder_layers.extend([
+            nn.Conv2d(current_channels, 3, kernel_size=3, padding=1),
             nn.Tanh()
         ])
         
-        return layers
+        return nn.Sequential(*decoder_layers)
     
-    def _calculate_upsampling_path(self, start_size, target_size):
-        """
-        Calculate the optimal upsampling path from start_size to target_size
-        """
-        path = [start_size]
-        current = start_size
-        
-        while current < target_size:
-            # Try to double the size, but don't exceed target
-            next_size = min(current * 2, target_size)
-            
-            # If we can't double exactly to target, use intermediate steps
-            if next_size == target_size and current * 2 != target_size:
-                # Add intermediate step if the jump is too large
-                if target_size / current > 2.5:
-                    intermediate = current * 2
-                    if intermediate < target_size:
-                        path.append(intermediate)
-                        current = intermediate
-                        continue
-            
-            path.append(next_size)
-            current = next_size
-        
-        return path
-    
-    def _calculate_conv_params(self, input_size, output_size):
-        """
-        Calculate kernel_size, stride, and padding for exact output size
-        Formula: output_size = (input_size - 1) * stride - 2 * padding + kernel_size
-        """
-        if output_size == input_size * 2:
-            # Standard 2x upsampling
-            return 4, 2, 1
-        elif output_size == input_size:
-            # No upsampling
-            return 3, 1, 1
-        else:
-            # Custom upsampling - use adaptive approach
-            stride = max(1, output_size // input_size)
-            kernel_size = max(3, stride + 2)
-            padding = (stride * (input_size - 1) + kernel_size - output_size) // 2
-            return kernel_size, stride, max(0, padding)
-
     def encode(self, x):
-        with torch.set_grad_enabled(False):
-            dinov2_outputs = self.dinov2(x)
-            features = dinov2_outputs.last_hidden_state[:, 0, :]  # shape: (batch_size, 768)
-        
-        projected_features = self.encoder_projection(features)
-        mu = self.mu_layer(projected_features)
-        logvar = self.logvar_layer(projected_features)
-
-        return mu, logvar
+        """Encode images to latent space"""
+        return self.encoder(x)
     
     def reparameterize(self, mu, logvar):
+        """Reparameterization trick"""
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
     
     def decode(self, z):
+        """Decode latent vectors to images"""
         return self.decoder(z)
     
     def forward(self, x):
+        """Forward pass through VAE"""
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
         reconstructed_x = self.decode(z)
@@ -539,61 +435,29 @@ class VAE(nn.Module):
         return self.decode(z)
 
     def get_architecture_info(self):
-        """
-        Return information about the architecture for debugging/analysis
-        """
-        # Calculate projection dimensions
-        projection_info = []
-        for i, layer in enumerate(self.encoder_projection):
-            if isinstance(layer, nn.Linear):
-                projection_info.append(f"Linear {layer.in_features} -> {layer.out_features}")
-        
-        # Calculate decoder expansion
-        decoder_info = []
-        for i, layer in enumerate(self.decoder):
-            if isinstance(layer, nn.Linear):
-                decoder_info.append(f"Linear {layer.in_features} -> {layer.out_features}")
-            elif isinstance(layer, nn.ConvTranspose2d):
-                decoder_info.append(f"ConvTranspose2d {layer.in_channels} -> {layer.out_channels}")
+        """Return information about the architecture"""
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        encoder_params = sum(p.numel() for p in self.encoder.parameters())
+        decoder_params = sum(p.numel() for p in self.decoder.parameters())
         
         return {
             'latent_dim': self.latent_dim,
-            'dinov2_dim': self.dinov2_dim,
-            'projection_layers': projection_info,
-            'decoder_layers': decoder_info,
-            'total_params': sum(p.numel() for p in self.parameters() if p.requires_grad)
+            'image_size': self.image_size,
+            'total_params': total_params,
+            'trainable_params': trainable_params,
+            'encoder_params': encoder_params,
+            'decoder_params': decoder_params
         }
 
 class Reshape(nn.Module):
+    """Reshape layer"""
     def __init__(self, *shape):
         super(Reshape, self).__init__()
         self.shape = shape
 
     def forward(self, x):
         return x.view(self.shape)
-
-class AdaptiveUpsampler(nn.Module):
-    """
-    Adaptive upsampler that ensures exact output size
-    """
-    def __init__(self, in_channels, out_channels, target_size):
-        super().__init__()
-        self.target_size = target_size
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        
-    def forward(self, x):
-        # Apply convolution first
-        x = self.conv(x)
-        
-        # Get current size
-        current_size = x.size(-1)  # Assumes square images
-        
-        # If size doesn't match target, use interpolation
-        if current_size != self.target_size:
-            x = F.interpolate(x, size=(self.target_size, self.target_size), 
-                            mode='bilinear', align_corners=False)
-        
-        return x
 
 def vae_loss(recon_x, x, mu, logvar, beta=1.0):
     """
@@ -613,36 +477,6 @@ def vae_loss(recon_x, x, mu, logvar, beta=1.0):
     kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     
     return recon_loss + beta * kl_loss, recon_loss, kl_loss
-
-
-def train_epoch(model, dataloader, optimizer, device, beta=1.0):
-    """
-    Train one epoch with improved monitoring
-    """
-    model.train()
-    total_loss = 0
-    total_recon_loss = 0
-    total_kl_loss = 0
-    
-    for batch_idx, (data, _) in enumerate(dataloader):
-        data = data.to(device)
-        optimizer.zero_grad()
-        
-        recon_batch, mu, logvar = model(data)
-        loss, recon_loss, kl_loss = vae_loss(recon_batch, data, mu, logvar, beta)
-        
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        total_recon_loss += recon_loss.item()
-        total_kl_loss += kl_loss.item()
-    
-    avg_loss = total_loss / len(dataloader.dataset)
-    avg_recon_loss = total_recon_loss / len(dataloader.dataset)
-    avg_kl_loss = total_kl_loss / len(dataloader.dataset)
-    
-    return avg_loss, avg_recon_loss, avg_kl_loss
 
 class VAETrainer:
     """
@@ -671,7 +505,7 @@ class VAETrainer:
         
         # Create experiment directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.experiment_dir = self.save_dir / f"vae_{timestamp}"
+        self.experiment_dir = self.save_dir / f"vae_resnet_{timestamp}"
         self.experiment_dir.mkdir(parents=True, exist_ok=True)
         
         # Save configs
@@ -703,26 +537,10 @@ class VAETrainer:
         logger.info(f"Experiment directory: {self.experiment_dir}")
         
         # Log parameter information
-        params_info = self._get_trainable_params_info()
-        logger.info(f"Model parameters:")
-        logger.info(f"  Total: {params_info['total_params']:,}")
-        logger.info(f"  Trainable: {params_info['trainable_params']:,}")
-        logger.info(f"  DINOv2 (frozen): {params_info['dinov2_params']:,}")
-        logger.info(f"  Savable in checkpoint: {params_info['savable_params']:,}")
-        logger.info(f"Trainable parameters (excluding DINOv2): {self._get_trainable_params_info()['trainable_params']:,}")
-    
-    def _get_trainable_params_info(self):
-        """Get information about trainable parameters (excluding DINOv2)"""
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        dinov2_params = sum(p.numel() for p in self.model.dinov2.parameters())
-        
-        return {
-            'total_params': total_params,
-            'trainable_params': trainable_params,
-            'dinov2_params': dinov2_params,
-            'savable_params': total_params - dinov2_params
-        }
+        arch_info = self.model.get_architecture_info()
+        logger.info(f"Model architecture:")
+        for key, value in arch_info.items():
+            logger.info(f"  {key}: {value:,}" if isinstance(value, int) else f"  {key}: {value}")
     
     def _save_configs(self):
         """Save configuration files"""
@@ -739,42 +557,20 @@ class VAETrainer:
         """Create and initialize the model"""
         model = VAE(**self.model_config)
         model.to(self.device)
-        
-        # Log model architecture
-        arch_info = model.get_architecture_info()
-        logger.info("Model Architecture:")
-        for key, value in arch_info.items():
-            logger.info(f"  {key}: {value}")
-        
         return model
     
     def _create_optimizer(self) -> optim.Optimizer:
-        """Create optimizer with different learning rates for encoder/decoder"""
+        """Create optimizer"""
         
-        # Separate parameters
-        encoder_params = (
-            list(self.model.encoder_projection.parameters()) +
-            list(self.model.mu_layer.parameters()) +
-            list(self.model.logvar_layer.parameters())
-        )
+        # Separate parameters for different learning rates
+        encoder_params = list(self.model.encoder.parameters())
         decoder_params = list(self.model.decoder.parameters())
-        
-        # Add DINOv2 parameters if not frozen
-        dinov2_params = []
-        if not self.model_config.get('freeze_encoder', True):
-            dinov2_params = list(self.model.dinov2.parameters())
         
         # Create parameter groups
         param_groups = [
             {'params': encoder_params, 'lr': self.training_config['encoder_lr']},
             {'params': decoder_params, 'lr': self.training_config['decoder_lr']}
         ]
-        
-        if dinov2_params:
-            param_groups.append({
-                'params': dinov2_params, 
-                'lr': self.training_config.get('dinov2_lr', 1e-6)
-            })
         
         optimizer = optim.AdamW(
             param_groups,
@@ -1185,10 +981,9 @@ def main():
     
     # Configuration
     model_config = {
-        'latent_dim': 128,
-        'image_size': 128,
-        'projection_multiplier': 1.5,
-        'min_hidden_dim': 512
+        'latent_dim': 256,
+        'image_size': 224,
+        'resnet_variant': 'resnet50',
     }
     
     training_config = {
@@ -1213,32 +1008,23 @@ def main():
     
     data_config = {
         'batch_size': 16,
-        'image_size': 128,
+        'image_size': 224,
         'train_split': 0.8,
         'augment': True,
         'num_workers': 4,
-        'max_images': 1000
+        'max_images': None
     }
     
     try:
         # Create data loaders
-        logger.info("Creating data loaders...")
+        logger.info(f"Creating data loaders for CelebA dataset...")
         train_loader, val_loader = create_data_loaders(**data_config)
-        
-        # Visualize some training data
-        logger.info("Visualizing training data...")
-        visualize_batch(train_loader, num_images=8)
         
         # Initialize trainer
         trainer = VAETrainer(model_config, training_config, data_config)
         
         # Start training
         trainer.train(train_loader, val_loader)
-        
-        # Final testing
-        logger.info("Generating final samples...")
-        trainer.generate_samples(epoch=training_config['epochs']-1, num_samples=16)
-        trainer.test_reconstruction(val_loader, epoch=training_config['epochs']-1, num_samples=8)
         
     except Exception as e:
         logger.error(f"Training failed: {e}")
