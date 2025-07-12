@@ -1,7 +1,6 @@
-
-
 import os
 import math
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,7 +14,7 @@ from datetime import datetime
 from tqdm import tqdm
 import json
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 from dotenv import load_dotenv
 import logging
 
@@ -34,10 +33,14 @@ class CelebADataset(Dataset):
         self.transform = transform
         
         # Kaggle CelebA structure: img_align_celeba/ folder with .jpg files
-        img_dir = self.root_dir / "img_align_celeba"
-        if not img_dir.exists():
-            img_dir = self.root_dir  # Fallback to root if direct structure
-        
+        img_dir = self.root_dir
+        new_img_dir = img_dir / "img_align_celeba"
+        if new_img_dir.exists():
+            img_dir = new_img_dir
+            new_img_dir = img_dir / "img_align_celeba"
+            if new_img_dir.exists():
+                img_dir = new_img_dir
+
         self.image_paths = list(img_dir.glob("*.jpg"))
         
         if max_images:
@@ -249,6 +252,9 @@ class ResNetEncoder(nn.Module):
         # Freeze early layers if requested
         if freeze_early_layers:
             self._freeze_early_layers()
+        else:
+            for param in self.backbone.parameters():
+                param.requires_grad = True
         
         # Projection layers
         self.feature_projection = nn.Sequential(
@@ -277,6 +283,7 @@ class ResNetEncoder(nn.Module):
             if str(i) in layers_to_freeze:
                 for param in module.parameters():
                     param.requires_grad = False
+                logger.info(f"Froze layer {name} in ResNet backbone")
         
         logger.info("Frozen early ResNet layers")
     
@@ -480,14 +487,16 @@ def vae_loss(recon_x, x, mu, logvar, beta=1.0):
 
 class VAETrainer:
     """
-    Complete training and testing pipeline for Cat VAE
+    Complete training and testing pipeline for VAE
     """
     
     def __init__(self, 
                  model_config: dict,
                  training_config: dict,
                  data_config: dict,
-                 save_dir: str = "experiments"):
+                 save_dir: str = "experiments",
+                 resume_from: Optional[str] = None,
+                 save_path: Optional[str] = None):
         """
         Initialize the trainer
         
@@ -496,20 +505,42 @@ class VAETrainer:
             training_config: Training hyperparameters
             data_config: Data loading configuration
             save_dir: Directory to save results
+            resume_from: Path to checkpoint to resume from, or 'latest' to auto-resume
+            save_path: Specific path to save the experiment, overrides save_dir and timestamp
         """
         
         self.model_config = model_config
         self.training_config = training_config
         self.data_config = data_config
-        self.save_dir = Path(save_dir)
         
-        # Create experiment directory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.experiment_dir = self.save_dir / f"vae_resnet_{timestamp}"
-        self.experiment_dir.mkdir(parents=True, exist_ok=True)
+        # Early stopping parameters
+        self.early_stopping_patience = training_config.get('early_stopping_patience', None)
+        self.early_stopping_delta = training_config.get('early_stopping_delta', 0.001)
+        self.patience_counter = 0
+        self.should_stop_early = False
+        
+        # Handle resuming from checkpoint
+        self.resume_from = resume_from
+        self.start_epoch = 0
+        
+        if save_path:
+            self.experiment_dir = Path(save_path)
+            self.experiment_dir.mkdir(parents=True, exist_ok=True)
+        elif resume_from == 'latest':
+            # Find the latest experiment directory
+            self.experiment_dir = self._find_latest_experiment(Path(save_dir))
+        elif resume_from and Path(resume_from).exists():
+            # Resume from specific checkpoint
+            self.experiment_dir = Path(resume_from).parent
+        else:
+            # Create new experiment directory
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.experiment_dir = Path(save_dir) / f"vae_resnet_{timestamp}"
+            self.experiment_dir.mkdir(parents=True, exist_ok=True)
         
         # Save configs
-        self._save_configs()
+        if not resume_from:
+            self._save_configs()
         
         # Device setup
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -534,8 +565,16 @@ class VAETrainer:
         self.best_val_loss = float('inf')
         self.best_epoch = 0
         
+        # Load checkpoint if resuming
+        if resume_from:
+            self._resume_training()
+        
         logger.info(f"Experiment directory: {self.experiment_dir}")
         
+        # Early stopping info
+        if self.early_stopping_patience:
+            logger.info(f"Early stopping enabled: patience={self.early_stopping_patience}, delta={self.early_stopping_delta}")
+    
         # Log parameter information
         arch_info = self.model.get_architecture_info()
         logger.info(f"Model architecture:")
@@ -714,15 +753,20 @@ class VAETrainer:
             return schedule.get('beta', 1.0)
     
     def save_checkpoint(self, epoch: int, is_best: bool = False):
-        """Save model checkpoint (excluding DINOv2 to reduce size)"""
+        """Save model checkpoint, including epoch in the filename."""
         
-        # Get model state dict without DINOv2 parameters
-        model_state_dict = {}
-        for name, param in self.model.state_dict().items():
-            # Skip DINOv2 parameters since they're frozen and can be reloaded
-            if not name.startswith('dinov2.'):
-                model_state_dict[name] = param
+        # Determine if the full model (including ResNet) should be saved
+        save_full_model = not self.model_config.get('freeze_early_layers', True)
         
+        if save_full_model:
+            model_state_dict = self.model.state_dict()
+            filename_marker = "_with_resnet"
+            logger.info("Saving full model checkpoint (including ResNet)")
+        else:
+            model_state_dict = {k: v for k, v in self.model.state_dict().items() if not k.startswith('encoder.backbone.')}
+            filename_marker = ""
+            logger.info("Saving partial model checkpoint (excluding ResNet backbone)")
+
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model_state_dict,
@@ -736,6 +780,8 @@ class VAETrainer:
             'val_kl_losses': self.val_kl_losses,
             'best_val_loss': self.best_val_loss,
             'best_epoch': self.best_epoch,
+            'patience_counter': self.patience_counter,
+            'contains_resnet': save_full_model,
             'config': {
                 'model_config': self.model_config,
                 'training_config': self.training_config,
@@ -743,37 +789,51 @@ class VAETrainer:
             }
         }
         
-        # Save latest checkpoint
-        torch.save(checkpoint, self.experiment_dir / 'latest_checkpoint.pth')
+        # Save epoch-specific checkpoint
+        epoch_checkpoint_path = self.experiment_dir / f'checkpoint_epoch_{epoch+1}{filename_marker}.pth'
+        torch.save(checkpoint, epoch_checkpoint_path)
+        
+        # Save latest checkpoint (symlink or copy)
+        latest_checkpoint_path = self.experiment_dir / 'latest_checkpoint.pth'
+        if latest_checkpoint_path.exists():
+            latest_checkpoint_path.unlink()
+        os.symlink(epoch_checkpoint_path.name, latest_checkpoint_path)
         
         # Save best checkpoint
         if is_best:
-            torch.save(checkpoint, self.experiment_dir / 'best_checkpoint.pth')
+            best_checkpoint_path = self.experiment_dir / f'best_checkpoint{filename_marker}.pth'
+            # Remove the old best checkpoint if the name changes
+            old_best_checkpoint_path = self.experiment_dir / f'best_checkpoint{"" if save_full_model else "_with_resnet"}.pth'
+            if old_best_checkpoint_path.exists() and old_best_checkpoint_path != best_checkpoint_path:
+                old_best_checkpoint_path.unlink()
+            torch.save(checkpoint, best_checkpoint_path)
             logger.info(f"New best model saved at epoch {epoch+1}")
         
-        # Log checkpoint size
-        checkpoint_size = (self.experiment_dir / 'latest_checkpoint.pth').stat().st_size / (1024 * 1024)
-        logger.info(f"Checkpoint saved (size: {checkpoint_size:.2f} MB)")
+        checkpoint_size = epoch_checkpoint_path.stat().st_size / (1024 * 1024)
+        logger.info(f"Checkpoint saved to {epoch_checkpoint_path} (size: {checkpoint_size:.2f} MB)")
     
     def load_checkpoint(self, checkpoint_path: str):
-        """Load model checkpoint (DINOv2 will be reloaded from pretrained weights)"""
+        """Load model checkpoint."""
         
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
-        # Load model state dict, but skip missing DINOv2 parameters
+        # Check if the checkpoint contains the full model
+        contains_resnet = checkpoint.get('contains_resnet', False)
         model_state_dict = checkpoint['model_state_dict']
         
-        # Get current model state dict
-        current_state_dict = self.model.state_dict()
-        
-        # Update only the parameters that exist in the checkpoint
-        # DINOv2 parameters will remain as pretrained weights
-        for name, param in model_state_dict.items():
-            if name in current_state_dict:
-                current_state_dict[name] = param
-        
-        # Load the updated state dict
-        self.model.load_state_dict(current_state_dict)
+        if contains_resnet:
+            logger.info("Loading full model state from checkpoint (including ResNet)")
+            self.model.load_state_dict(model_state_dict)
+        else:
+            logger.info("Loading partial model state from checkpoint (excluding ResNet)")
+            current_state_dict = self.model.state_dict()
+            
+            # Update only the parameters that exist in the checkpoint
+            for name, param in model_state_dict.items():
+                if name in current_state_dict:
+                    current_state_dict[name] = param
+            
+            self.model.load_state_dict(current_state_dict)
         
         # Load optimizer and scheduler states
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -789,9 +849,81 @@ class VAETrainer:
         self.best_val_loss = checkpoint['best_val_loss']
         self.best_epoch = checkpoint['best_epoch']
         
+        # Restore early stopping state if available
+        if 'patience_counter' in checkpoint:
+            self.patience_counter = checkpoint['patience_counter']
+        else:
+            # Reset patience counter when loading old checkpoints
+            self.patience_counter = 0
+        
         logger.info(f"Checkpoint loaded from {checkpoint_path}")
-        logger.info("DINOv2 parameters kept as pretrained weights")
+        logger.info(f"Resuming from epoch {checkpoint['epoch'] + 1}")
+        logger.info(f"Best validation loss so far: {self.best_val_loss:.4f}")
+        if self.early_stopping_patience:
+            logger.info(f"Early stopping patience: {self.patience_counter}/{self.early_stopping_patience}")
+        
         return checkpoint['epoch']
+    
+    def _find_latest_experiment(self, save_dir: Path) -> Path:
+        """Find the latest experiment directory"""
+        experiment_dirs = list(save_dir.glob("vae_resnet_*"))
+        
+        if not experiment_dirs:
+            raise FileNotFoundError("No previous experiments found for resuming")
+        
+        # Sort by timestamp in directory name
+        experiment_dirs.sort(key=lambda x: x.name.split('_')[-1])
+        latest_dir = experiment_dirs[-1]
+        
+        logger.info(f"Found latest experiment: {latest_dir}")
+        return latest_dir
+    
+    def _resume_training(self):
+        """Resume training from checkpoint"""
+        # Try to find checkpoint in experiment directory
+        checkpoint_path = None
+        
+        if self.resume_from == 'latest':
+            # Look for best checkpoint first, then latest
+            best_checkpoint_regular = self.experiment_dir / 'best_checkpoint.pth'
+            best_checkpoint_with_resnet = self.experiment_dir / 'best_checkpoint_with_resnet.pth'
+            latest_checkpoint = self.experiment_dir / 'latest_checkpoint.pth'
+
+            if best_checkpoint_with_resnet.exists():
+                checkpoint_path = best_checkpoint_with_resnet
+                logger.info("Resuming from best checkpoint (with ResNet)")
+            elif best_checkpoint_regular.exists():
+                checkpoint_path = best_checkpoint_regular
+                logger.info("Resuming from best checkpoint")
+            elif latest_checkpoint.exists():
+                checkpoint_path = latest_checkpoint
+                logger.info("Resuming from latest checkpoint")
+        else:
+            if self.resume_from:
+                checkpoint_path = Path(self.resume_from)
+        
+        if checkpoint_path and checkpoint_path.exists():
+            self.start_epoch = self.load_checkpoint(str(checkpoint_path)) + 1
+            logger.info(f"Resuming training from epoch {self.start_epoch}")
+        else:
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
+    def _check_early_stopping(self, val_loss: float) -> bool:
+        """Check if training should stop early"""
+        if self.early_stopping_patience is None:
+            return False
+        
+        # Check if validation loss improved significantly
+        if self.best_val_loss - val_loss >= self.early_stopping_delta:
+            self.patience_counter = 0
+        else:
+            self.patience_counter += 1
+            
+        if self.patience_counter >= self.early_stopping_patience:
+            logger.info(f"Early stopping triggered after {self.patience_counter} epochs without improvement")
+            return True
+            
+        return False
     
     def plot_training_curves(self):
         """Plot training curves"""
@@ -845,56 +977,81 @@ class VAETrainer:
         
         logger.info("Starting training...")
         
-        for epoch in range(self.training_config['epochs']):
-            # Train
-            train_loss, train_recon, train_kl = self.train_epoch(train_loader, epoch)
-            
-            # Validate
-            val_loss, val_recon, val_kl = self.validate(val_loader, epoch)
-            
-            # Update scheduler
-            if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                self.scheduler.step(val_loss)
-            else:
-                self.scheduler.step()
-            
-            # Track losses
-            self.train_losses.append(train_loss)
-            self.val_losses.append(val_loss)
-            self.train_recon_losses.append(train_recon)
-            self.train_kl_losses.append(train_kl)
-            self.val_recon_losses.append(val_recon)
-            self.val_kl_losses.append(val_kl)
-            
-            # Check for best model
-            is_best = val_loss < self.best_val_loss
-            if is_best:
-                self.best_val_loss = val_loss
-                self.best_epoch = epoch
-            
-            # Save checkpoint
-            if (epoch + 1) % self.training_config.get('save_freq', 10) == 0:
-                self.save_checkpoint(epoch, is_best)
-            
-            # Log epoch results
-            logger.info(f'Epoch {epoch+1}/{self.training_config["epochs"]}:')
-            logger.info(f'  Train Loss: {train_loss:.4f} (Recon: {train_recon:.4f}, KL: {train_kl:.4f})')
-            logger.info(f'  Val Loss: {val_loss:.4f} (Recon: {val_recon:.4f}, KL: {val_kl:.4f})')
-            logger.info(f'  Best Val Loss: {self.best_val_loss:.4f} (Epoch {self.best_epoch+1})')
-            
-            # Generate samples periodically
-            if (epoch + 1) % self.training_config.get('sample_freq', 10) == 0:
-                self.generate_samples(epoch, num_samples=8)
-                self.test_reconstruction(val_loader, epoch, num_samples=8)
+        # Handle keyboard interruption gracefully
+        try:
+            for epoch in range(self.start_epoch, self.training_config['epochs']):
+                # Train
+                train_loss, train_recon, train_kl = self.train_epoch(train_loader, epoch)
+                
+                # Validate
+                val_loss, val_recon, val_kl = self.validate(val_loader, epoch)
+                
+                # Update scheduler
+                if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.step(val_loss)
+                else:
+                    self.scheduler.step()
+                
+                # Track losses
+                self.train_losses.append(train_loss)
+                self.val_losses.append(val_loss)
+                self.train_recon_losses.append(train_recon)
+                self.train_kl_losses.append(train_kl)
+                self.val_recon_losses.append(val_recon)
+                self.val_kl_losses.append(val_kl)
+                
+                # Check early stopping
+                if self._check_early_stopping(val_loss):
+                    self.should_stop_early = True
+                
+                # Check for best model
+                is_best = val_loss < self.best_val_loss
+                if is_best:
+                    self.best_val_loss = val_loss
+                    self.best_epoch = epoch
+                
+                # Save checkpoint
+                if (epoch + 1) % self.training_config.get('save_freq', 10) == 0 or self.should_stop_early:
+                    self.save_checkpoint(epoch, is_best)
+                
+                # Log epoch results
+                logger.info(f'Epoch {epoch+1}/{self.training_config["epochs"]}:')
+                logger.info(f'  Train Loss: {train_loss:.4f} (Recon: {train_recon:.4f}, KL: {train_kl:.4f})')
+                logger.info(f'  Val Loss: {val_loss:.4f} (Recon: {val_recon:.4f}, KL: {val_kl:.4f})')
+                logger.info(f'  Best Val Loss: {self.best_val_loss:.4f} (Epoch {self.best_epoch+1})')
+                
+                if self.early_stopping_patience:
+                    logger.info(f'  Early stopping patience: {self.patience_counter}/{self.early_stopping_patience}')
+                
+                # Generate samples periodically
+                if (epoch + 1) % self.training_config.get('sample_freq', 10) == 0:
+                    self.generate_samples(epoch, num_samples=8)
+                    self.test_reconstruction(val_loader, epoch, num_samples=8)
+                
+                # Early stopping check
+                if self.should_stop_early:
+                    logger.info(f"Early stopping at epoch {epoch+1}")
+                    break
+        
+        except KeyboardInterrupt:
+            logger.info("\nTraining interrupted by user")
+            logger.info("Saving current checkpoint...")
+            self.save_checkpoint(epoch, is_best=False)
+            logger.info("Checkpoint saved successfully")
+            raise
         
         # Final save
-        self.save_checkpoint(self.training_config['epochs'] - 1, is_best=False)
+        if not self.should_stop_early:
+            self.save_checkpoint(self.training_config['epochs'] - 1, is_best=False)
         
         # Plot training curves
         self.plot_training_curves()
         
         logger.info("Training completed!")
         logger.info(f"Best validation loss: {self.best_val_loss:.4f} at epoch {self.best_epoch+1}")
+        
+        if self.should_stop_early:
+            logger.info(f"Training stopped early due to no improvement for {self.early_stopping_patience} epochs")
     
     def generate_samples(self, epoch: int, num_samples: int = 8):
         """Generate and save sample images"""
@@ -981,19 +1138,22 @@ def main():
     
     # Configuration
     model_config = {
-        'latent_dim': 256,
+        'latent_dim': 128,
         'image_size': 224,
         'resnet_variant': 'resnet50',
+        'freeze_early_layers': False,
     }
     
     training_config = {
-        'epochs': 100,
+        'epochs': 300,
         'encoder_lr': 1e-4,
         'decoder_lr': 2e-4,
         'weight_decay': 1e-4,
         'grad_clip': 1.0,
-        'save_freq': 10,
+        'save_freq': 5,
         'sample_freq': 5,
+        'early_stopping_patience': 15,
+        'early_stopping_delta': 0.001,
         'beta_schedule': {
             'type': 'linear',
             'start_beta': 0.0,
@@ -1003,7 +1163,9 @@ def main():
         'scheduler': {
             'type': 'cosine',
             'min_lr': 1e-6
-        }
+        },
+        'resume_from': None,
+        'save_path': None,
     }
     
     data_config = {
@@ -1015,17 +1177,39 @@ def main():
         'max_images': None
     }
     
+    resume_from = training_config.get('resume_from')
+    save_path = training_config.get('save_path')
+
+    if len(sys.argv) > 1:
+        for arg in sys.argv[1:]:
+            if arg == '--resume-latest':
+                resume_from = 'latest'
+            elif arg.startswith('--resume='):
+                resume_from = arg.split('=', 1)[1]
+            elif arg.startswith('--save-path='):
+                save_path = arg.split('=', 1)[1]
+
     try:
         # Create data loaders
         logger.info(f"Creating data loaders for CelebA dataset...")
         train_loader, val_loader = create_data_loaders(**data_config)
         
-        # Initialize trainer
-        trainer = VAETrainer(model_config, training_config, data_config)
+        # Initialize trainer with optional resume
+        trainer = VAETrainer(
+            model_config, 
+            training_config, 
+            data_config,
+            resume_from=resume_from,
+            save_path=save_path
+        )
         
         # Start training
         trainer.train(train_loader, val_loader)
         
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user")
+        logger.info("You can resume training by running:")
+        logger.info("python main.py --resume-latest")
     except Exception as e:
         logger.error(f"Training failed: {e}")
         raise
