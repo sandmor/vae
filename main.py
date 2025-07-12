@@ -1,6 +1,8 @@
 import os
 import math
 import sys
+import zipfile
+import requests
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,7 +25,53 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
+def download_celeba_dataset():
+    """Download and extract the CelebA dataset from Kaggle"""
+    
+    # Create directories if they don't exist
+    os.makedirs("celeba", exist_ok=True)
+    
+    # Download the dataset
+    url = "https://www.kaggle.com/api/v1/datasets/download/jessicali9530/celeba-dataset"
+    output_file = "celeba-dataset.zip"
+    
+    print("Downloading CelebA dataset...")
+    
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        # Download with progress
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded = 0
+        
+        with open(output_file, 'wb') as f:
+            with tqdm(total=total_size, unit='B', unit_scale=True, desc="Downloading") as pbar:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        pbar.update(len(chunk))
+        
+        print(f"\nDownload completed: {output_file}")
+        
+        # Extract the zip file
+        print("Extracting dataset...")
+        with zipfile.ZipFile(output_file, 'r') as zip_ref:
+            zip_ref.extractall("celeba")
+        
+        print("Extraction completed!")
+        
+        os.remove(output_file)
+        
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading file: {e}")
+        return False
+    except zipfile.BadZipFile as e:
+        print(f"Error extracting zip file: {e}")
+        return False
+    
+    return True
 
 class CelebADataset(Dataset):
     """Simple CelebA dataset loader for Kaggle dataset structure"""
@@ -34,12 +82,15 @@ class CelebADataset(Dataset):
         
         # Kaggle CelebA structure: img_align_celeba/ folder with .jpg files
         img_dir = self.root_dir
+        logger.info(f"Loading CelebA dataset from {img_dir}")
+
         new_img_dir = img_dir / "img_align_celeba"
         if new_img_dir.exists():
             img_dir = new_img_dir
             new_img_dir = img_dir / "img_align_celeba"
             if new_img_dir.exists():
                 img_dir = new_img_dir
+
 
         self.image_paths = list(img_dir.glob("*.jpg"))
         
@@ -107,10 +158,10 @@ def create_data_loaders(dataset_path=None, batch_size=32,
     
     # Get dataset path
     if dataset_path is None:
-        dataset_path = os.getenv('CELEBA_DATASET_PATH', 'celeba/img_align_celeba/img_align_celeba')
+        dataset_path = os.getenv('CELEBA_DATASET_PATH', 'celeba')
 
     if not os.path.exists(dataset_path):
-        raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
+        download_celeba_dataset()
     
     # Get transforms
     train_transform, val_transform = get_data_transforms(image_size, augment)
