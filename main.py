@@ -1028,7 +1028,7 @@ class VAETrainer:
         
         logger.info("Starting training...")
         
-        # Handle keyboard interruption gracefully
+        epoch = 0
         try:
             for epoch in range(self.start_epoch, self.training_config['epochs']):
                 # Train
@@ -1085,24 +1085,20 @@ class VAETrainer:
                     break
         
         except KeyboardInterrupt:
-            logger.info("\nTraining interrupted by user")
-            logger.info("Saving current checkpoint...")
-            self.save_checkpoint(epoch, is_best=False)
-            logger.info("Checkpoint saved successfully")
-            raise
+            logger.info(f"\nTraining interrupted by user at epoch {epoch+1}")
         
-        # Final save
-        if not self.should_stop_early:
-            self.save_checkpoint(self.training_config['epochs'] - 1, is_best=False)
-        
-        # Plot training curves
-        self.plot_training_curves()
-        
-        logger.info("Training completed!")
-        logger.info(f"Best validation loss: {self.best_val_loss:.4f} at epoch {self.best_epoch+1}")
-        
-        if self.should_stop_early:
-            logger.info(f"Training stopped early due to no improvement for {self.early_stopping_patience} epochs")
+        finally:
+            # Plot training curves if there's any history
+            if self.train_losses:
+                logger.info("Generating training curves...")
+                self.plot_training_curves()
+                logger.info(f"Training curves saved to {self.experiment_dir / 'training_curves.png'}")
+
+            if self.should_stop_early:
+                logger.info(f"Training stopped early due to no improvement for {self.early_stopping_patience} epochs")
+            
+            logger.info("Training finished.")
+            logger.info(f"Best validation loss: {self.best_val_loss:.4f} at epoch {self.best_epoch+1}")
     
     def generate_samples(self, epoch: int, num_samples: int = 8):
         """Generate and save sample images"""
@@ -1189,27 +1185,27 @@ def main():
     
     # Configuration
     model_config = {
-        'latent_dim': 128,
-        'image_size': 224,
-        'resnet_variant': 'resnet50',
-        'freeze_early_layers': False,
+        'latent_dim': 256,
+        'image_size': 64,
+        'resnet_variant': 'resnet34',
+        'freeze_early_layers': True,
     }
     
     training_config = {
         'epochs': 300,
-        'encoder_lr': 1e-4,
-        'decoder_lr': 2e-4,
+        'encoder_lr': 5e-5,
+        'decoder_lr': 1e-4,
         'weight_decay': 1e-4,
         'grad_clip': 1.0,
-        'save_freq': 5,
+        'save_freq': 1,
         'sample_freq': 5,
         'early_stopping_patience': 15,
-        'early_stopping_delta': 0.001,
+        'early_stopping_delta': 0.0002,
         'beta_schedule': {
             'type': 'linear',
             'start_beta': 0.0,
-            'end_beta': 1.0,
-            'warmup_epochs': 20
+            'end_beta': 2.0,
+            'warmup_epochs': 30
         },
         'scheduler': {
             'type': 'cosine',
@@ -1220,10 +1216,10 @@ def main():
     }
     
     data_config = {
-        'batch_size': 16,
-        'image_size': 224,
+        'batch_size': 256,
+        'image_size': 64,
         'train_split': 0.8,
-        'augment': True,
+        'augment': False,
         'num_workers': 4,
         'max_images': None
     }
@@ -1263,7 +1259,6 @@ def main():
         logger.info("python main.py --resume-latest")
     except Exception as e:
         logger.error(f"Training failed: {e}")
-        raise
 
 if __name__ == "__main__":
     main()
